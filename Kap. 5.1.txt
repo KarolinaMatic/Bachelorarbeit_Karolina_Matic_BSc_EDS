@@ -1,0 +1,97 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# Path of uploaded excel
+file_path = Path("/mnt/data/Data.xlsx")
+
+# 1. Load first sheet
+df = pd.read_excel(file_path)
+
+# Identify columns
+ts_col = next(c for c in df.columns if "Zeit" in c or "timestamp" in c or "Zeitpunkt" in c)
+val_col = next(c for c in df.columns if str(c).lower().startswith("wert") or str(c).lower().startswith("value"))
+
+df = df[[ts_col, val_col]].rename(columns={ts_col: "timestamp", val_col: "value"})
+df["timestamp"] = pd.to_datetime(df["timestamp"], dayfirst=True, errors="coerce")
+df = df.dropna(subset=["timestamp"])
+# Handle duplicates by averaging
+df = df.groupby("timestamp", as_index=False).mean().set_index("timestamp").sort_index()
+
+# 2. Build full 15-minute index
+full_index = pd.date_range(df.index.min(), df.index.max(), freq="15T")
+df_full = df.reindex(full_index)
+
+# 3. Interpolate gaps up to 3 steps
+isnan = df_full["value"].isna()
+grp = (~isnan).cumsum()
+gap_len = isnan.groupby(grp).transform("sum")
+small_gap = isnan & (gap_len <= 3)
+df_full.loc[small_gap, "value"] = np.nan
+df_full["value"] = df_full["value"].interpolate(method="time", limit=3)
+
+missing_before = isnan.sum()
+missing_after = df_full["value"].isna().sum()
+
+# 4. Outlier detection
+diff = df_full["value"].diff()
+z = (diff - diff.mean()) / diff.std(ddof=0)
+ts_outliers = df_full[np.abs(z) > 3][["value"]]
+
+daily_mean = df_full["value"].resample("D").mean()
+q1, q3 = daily_mean.quantile([0.25, 0.75])
+iqr = q3 - q1
+low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+day_outliers = daily_mean[(daily_mean < low) | (daily_mean > high)]
+
+# 5. Descriptive statistics
+desc_stats = df_full["value"].describe(percentiles=[0.05, 0.5, 0.95]).rename({
+    "count":"N",
+    "mean":"Mittelwert",
+    "std":"Std-Abw",
+    "min":"Minimum",
+    "5%":"5‑Perzentil",
+    "50%":"Median",
+    "95%":"95‑Perzentil",
+    "max":"Maximum"
+})
+stats_csv = Path("/mnt/data/descriptive_stats.csv")
+desc_stats.to_csv(stats_csv)
+
+# 6. Save outlier lists
+ts_csv = Path("/mnt/data/outliers_ts.csv")
+day_csv = Path("/mnt/data/outliers_day.csv")
+ts_outliers.to_csv(ts_csv)
+day_outliers.to_csv(day_csv)
+
+# 7. Plot cleaning overview
+plt.figure(figsize=(12, 4))
+plt.plot(df_full.index, df_full["value"], lw=0.3, label="Bereinigt")
+plt.scatter(df_full.index[df_full["value"].isna()], np.zeros(df_full["value"].isna().sum()),
+            s=8, marker="|", label="Fehlstelle (>45 min)")
+plt.scatter(ts_outliers.index, ts_outliers["value"], s=10, label="Ausreißer", marker="o")
+plt.ylabel("Leistung [kW]")
+plt.title("Datenbereinigung (15‑min-Auflösung)")
+plt.legend(ncol=3, loc="upper right")
+plt.tight_layout()
+fig_path = Path("/mnt/data/cleaning_overview.png")
+plt.savefig(fig_path, dpi=300)
+plt.close()
+
+# 8. Print summary
+total_points = len(df_full)
+print("──────── Outcome Datenbereinigung ────────")
+print(f"Messpunkte gesamt ............ {total_points:>10,d}")
+print(f"Fehlstellen vor  ............. {missing_before:>10,d}")
+print(f"Fehlstellen nach ............. {missing_after:>10,d}")
+print(f"Z‑Score-Ausreißer (15 min) .... {len(ts_outliers):>10,d}")
+print(f"IQR-Ausreißer   (Tage) ....... {len(day_outliers):>10,d}")
+print("\nDeskriptive Statistik:")
+print(desc_stats)
+print("\nDateien gespeichert:")
+print(f" - {stats_csv.name}")
+print(f" - {ts_csv.name}")
+print(f" - {day_csv.name}")
+print(f" - {fig_path.name}")
+print("──────────────────────────────────────────")
