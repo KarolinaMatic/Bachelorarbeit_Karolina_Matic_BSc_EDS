@@ -1,0 +1,109 @@
+import pandas as pd, numpy as np, matplotlib.pyplot as plt
+from pathlib import Path
+from statsmodels.tsa.seasonal import STL
+
+excel_path = Path("/mnt/data/PDAG_Lastgang.xlsx")
+
+df = pd.read_excel(excel_path)
+ts_col = next(c for c in df.columns if "Zeit" in c or "timestamp" in c or "Zeitpunkt" in c)
+val_col = next(c for c in df.columns if str(c).startswith("Wert") or str(c).lower().startswith("value"))
+df = df[[ts_col, val_col]].rename(columns={ts_col: "timestamp", val_col: "value"})
+df["timestamp"] = pd.to_datetime(df["timestamp"], dayfirst=True, errors="coerce")
+df = df.dropna(subset=["timestamp"])
+df = df.groupby("timestamp", as_index=False).mean().set_index("timestamp").sort_index()
+
+full_idx = pd.date_range(df.index.min(), df.index.max(), freq="15T")
+df_full = df.reindex(full_idx)
+
+# interpolate small gaps
+isnan = df_full["value"].isna()
+grp = (~isnan).cumsum()
+gap_len = isnan.groupby(grp).transform("sum")
+small_gap = isnan & (gap_len <= 3)
+df_full.loc[small_gap, "value"] = np.nan
+df_full["value"] = df_full["value"].interpolate(method="time", limit=3)
+
+# Hourly aggregation
+hourly = df_full["value"].resample("H").mean()
+
+# STL decomposition weekly seasonality
+stl = STL(hourly, period=24*7, robust=True)
+res = stl.fit()
+
+# components csv
+components_df = pd.DataFrame({
+    "timestamp": hourly.index,
+    "observed": hourly.values,
+    "trend": res.trend,
+    "seasonal": res.seasonal,
+    "resid": res.resid
+})
+comp_csv = Path("/mnt/data/stl_components.csv")
+components_df.to_csv(comp_csv, index=False)
+
+# plot components
+fig, axs = plt.subplots(4,1, figsize=(12,8), sharex=True)
+axs[0].plot(hourly.index, hourly, lw=0.5)
+axs[0].set_title("Beobachtete Reihe (Stundenmittel)")
+axs[1].plot(hourly.index, res.trend, color="orange")
+axs[1].set_title("Trend")
+axs[2].plot(hourly.index, res.seasonal, color="green")
+axs[2].set_title("Saisonalität (wöchentlich, 168 h)")
+axs[3].plot(hourly.index, res.resid, lw=0.5, color="red")
+axs[3].set_title("Residuum")
+plt.tight_layout()
+stl_fig_path = Path("/mnt/data/stl_components.png")
+fig.savefig(stl_fig_path, dpi=300)
+plt.close(fig)
+
+# Monthly profile
+monthly = df_full["value"].resample("M").mean()
+overall_mean = monthly.mean()
+season_index = (monthly/overall_mean)
+season_df = pd.DataFrame({"Month": monthly.index.strftime("%Y-%m"), "Average_kW": monthly.values, "S_index": season_index.values})
+season_csv = Path("/mnt/data/monthly_profile.csv")
+season_df.to_csv(season_csv, index=False)
+
+plt.figure(figsize=(10,4))
+plt.plot(monthly.index, monthly.values)
+plt.axhline(overall_mean, linestyle="--")
+plt.title("Monatlicher Durchschnittsverbrauch (kW)")
+plt.ylabel("kW")
+plt.tight_layout()
+mon_path = Path("/mnt/data/monthly_profile.png")
+plt.savefig(mon_path, dpi=300)
+plt.close()
+
+# Weekly profile
+hourly_df = hourly.reset_index()
+hourly_df.columns = ["timestamp","value"]
+hourly_df["dow"] = hourly_df["timestamp"].dt.dayofweek
+weekly_profile = hourly_df.groupby("dow")["value"].mean()
+plt.figure(figsize=(6,4))
+plt.bar(weekly_profile.index, weekly_profile.values)
+plt.xticks(range(7), ["Mo","Di","Mi","Do","Fr","Sa","So"])
+plt.ylabel("kW")
+plt.title("Wochentäglicher Verbrauch (Stundenmittel)")
+plt.tight_layout()
+week_path = Path("/mnt/data/weekly_profile.png")
+plt.savefig(week_path, dpi=300)
+plt.close()
+
+# Daily load curve
+df_full_reset = df_full.reset_index()
+df_full_reset.columns = ["timestamp","value"]
+df_full_reset["tod"] = df_full_reset["timestamp"].dt.time
+daily_curve = df_full_reset.groupby("tod")["value"].mean()
+plt.figure(figsize=(10,4))
+plt.plot(range(len(daily_curve)), daily_curve.values)
+plt.title("Typischer Tageslastgang (15‑min‑Mittel)")
+plt.ylabel("kW")
+plt.xlabel("Zeit (0‑24 h)")
+plt.xticks(ticks=np.linspace(0,len(daily_curve),9),
+           labels=["0","3","6","9","12","15","18","21","24"])
+plt.tight_layout()
+day_path = Path("/mnt/data/daily_profile.png")
+plt.savefig(day_path, dpi=300)
+plt.close()
+
+print("Outputs saved:", stl_fig_path, mon_path, week_path, day_path)
