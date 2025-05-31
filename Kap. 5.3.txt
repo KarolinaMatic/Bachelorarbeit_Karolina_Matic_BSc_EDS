@@ -1,0 +1,100 @@
+# ------------------------------------------------------------
+# prophet_analysis_pdag.py
+# Zeitreihen-Analyse & Prognose des PDAG-Lastgangs mit Prophet
+# ------------------------------------------------------------
+# Benötigte Pakete (Python ≥ 3.8):
+#   pip install pandas numpy matplotlib holidays prophet
+# ------------------------------------------------------------
+from pathlib import Path
+import pandas as pd
+import numpy as np
+from prophet import Prophet
+from prophet.diagnostics import cross_validation, performance_metrics
+import holidays
+
+# ------------------------------------------------------------------
+# 1.  Daten einlesen und vorbereiten
+# ------------------------------------------------------------------
+DATA_FILE = "PDAG_Lastgang.xlsx"            # Excel-Datei im Projektordner
+OUT_DIR   = Path("prophet_output")          # Ergebnisordner
+OUT_DIR.mkdir(exist_ok=True)
+
+# a) Rohdaten laden
+df = pd.read_excel(DATA_FILE)
+
+ts_col  = next(c for c in df.columns if "Zeit" in c)
+val_col = next(c for c in df.columns if str(c).startswith("Wert"))
+df = df[[ts_col, val_col]].rename(columns={ts_col: "timestamp", val_col: "value"})
+
+df["timestamp"] = pd.to_datetime(df["timestamp"], dayfirst=True, errors="coerce")
+df = (df.dropna(subset=["timestamp"])
+        .groupby("timestamp", as_index=False).mean()
+        .set_index("timestamp")
+        .sort_index())
+
+# b) lückenlose 15-min-Achse und Interpolation kleiner Gaps (≤45 min)
+full_idx = pd.date_range(df.index.min(), df.index.max(), freq="15T")
+df = df.reindex(full_idx)
+gap = df["value"].isna()
+grp = (~gap).cumsum()
+df.loc[gap & (gap.groupby(grp).transform("sum") <= 3), "value"] = np.nan
+df["value"] = df["value"].interpolate("time", limit=3)
+
+# c) Stundenmittel für Prophet
+hourly = df["value"].resample("H").mean().reset_index()
+hourly.columns = ["ds", "y"]
+hourly["is_weekend"] = hourly["ds"].dt.dayofweek.isin([5, 6]).astype(int)
+
+# d) Schweizer Feiertage + Klinikschließzeiten
+ch_holidays = holidays.CH(years=range(hourly["ds"].dt.year.min(),
+                                      hourly["ds"].dt.year.max()+1))
+clinic_closed = [("2020-12-24", "2021-01-02"),
+                 ("2021-12-24", "2022-01-02")]
+hol_rows = []
+for d in ch_holidays:
+    hol_rows.append({"ds": pd.Timestamp(d), "holiday": ch_holidays[d]})
+for start, end in clinic_closed:
+    for d in pd.date_range(start, end):
+        hol_rows.append({"ds": d, "holiday": "Klinikruhe"})
+hol_df = pd.DataFrame(hol_rows)
+
+# ------------------------------------------------------------------
+# 2.  Prophet-Modell aufsetzen und fitten
+# ------------------------------------------------------------------
+m = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=True,
+        changepoint_prior_scale=0.2,
+        holidays=hol_df,
+        holidays_prior_scale=5.0,
+    )
+m.add_regressor("is_weekend")
+m.fit(hourly)
+
+# ------------------------------------------------------------------
+# 3.  Cross-Validation und Kennzahlen
+# ------------------------------------------------------------------
+future   = hourly[["ds", "is_weekend"]]
+forecast = m.predict(future)
+hourly["yhat"]   = forecast["yhat"]
+hourly["residu"] = hourly["y"] - hourly["yhat"]
+hourly.to_csv(OUT_DIR / "hourly_with_residuals.csv", index=False)
+
+cv = cross_validation(m,
+                      initial="365 days",
+                      period="30 days",
+                      horizon="7 days",
+                      parallel="processes")
+metrics = performance_metrics(cv)
+metrics.to_csv(OUT_DIR / "prophet_cv_metrics.csv", index=False)
+
+# ------------------------------------------------------------------
+# 4.  Wichtigste Changepoints extrahieren
+# ------------------------------------------------------------------
+deltas = m.params["delta"].flatten()
+cp      = pd.Series(deltas, index=m.changepoints).sort_values(key=abs, ascending=False)
+cp.head(10).reset_index().rename(columns={"index": "ds", 0: "delta_kW"}) \
+   .to_csv(OUT_DIR / "prophet_changepoints_top10.csv", index=False)
+
+print(">>> Prophet-Analyse abgeschlossen – Ergebnisse im Ordner 'prophet_output'")
